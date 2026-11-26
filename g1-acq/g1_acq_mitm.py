@@ -1,41 +1,51 @@
-"""mitmproxy addon porting crhywun/g1-acq (v7.6.0) logic for Windows + iPhone."""
+"""mitmproxy addon porting crhywun/g1-acq (v7.12.0) logic for Windows + iPhone."""
 
-import html
+from __future__ import annotations
+
 import json
+import math
 import os
 import re
+import sys
+import threading
 from datetime import datetime, timezone
+from typing import Any
+
 from mitmproxy import http
 
-VERSION = "g1-acq-v7.6"
-REPORT_VERSION = "v7.6.0-mitm"
-SOURCE_PREFIX = "g1.ios.2tb."
-TARGET = "g1.2tb.ai.12months_ip_90p"
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
 
-SKU_MAP = {
-    "g1.ios.20tb.m.v2": "g1.20tb.1month_eft.acq",
-    "g1.ios.30tb.ai.pro.m": "g1.ai.ultra.1month_eft.acq",
-}
-FALLBACK = {
-    "g1.20tb.1month_eft.acq": "g1.20tb.3months_ip_90p.acq",
-    "g1.ai.ultra.1month_eft.acq": "g1.ai.ultra.3months_ip_90p.acq",
-}
+import g1_sku_report  # noqa: E402
+import mapping_config  # noqa: E402
+
+VERSION = "g1-acq-v7.12-mappings"
+REPORT_VERSION = g1_sku_report.VERSION
+SOURCE_PREFIX = mapping_config.SOURCE_PREFIX
+TEST_KEY = g1_sku_report.TEST_KEY
+SCAN_KEY = g1_sku_report.SCAN_KEY
 
 SCAN_LIMIT = 300
 RECENT_LIMIT = 10
-STATE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "g1_acq_state.json")
+MAX_EVENT_COUNT = 9007199254740991
+STATE_FILE = os.path.join(SCRIPT_DIR, "g1_acq_state.json")
 
-REPORT_URL_RE = re.compile(r"^https://one\.google\.com/g1-sku-report/?(?:\?.*)?$")
-AI_URL_RE = re.compile(r"^https://one\.google\.com/ai\?")
-VALID_ID_RE = re.compile(r"^(?:g1\.|com\.google\.one\.)[A-Za-z0-9._-]{1,160}$")
-DISCOVERY_TOKEN_RE = re.compile(
-    r"(^|[^A-Za-z0-9._@%-])((?:g1\.|com\.google\.one\.)[A-Za-z0-9._-]+)(?=$|[^A-Za-z0-9._-])"
-)
-REWRITE_TOKEN_RE = re.compile(
-    r"(^|[^A-Za-z0-9._@%-])(g1\.[A-Za-z0-9._-]+)(?=$|[^A-Za-z0-9._-])"
+KEY_TO_SLOT = {
+    SCAN_KEY: "scan",
+    TEST_KEY: "test",
+    mapping_config.KEY: "mappings",
+}
+
+ONE_GOOGLE_RE = re.compile(r"\Ahttps://one\.google\.com/")
+REPORT_URL_RE = g1_sku_report.REPORT_URL_RE
+AI_URL_RE = re.compile(r"\Ahttps://one\.google\.com/ai\?")
+VALID_ID_RE = re.compile(r"\A(?:g1\.|com\.google\.(?:one|gemini)\.)[A-Za-z0-9._-]{1,160}\Z")
+TOKEN_RE = re.compile(
+    r"(\A|[^A-Za-z0-9._@%-])((?:g1\.|com\.google\.(?:one|gemini)\.)[A-Za-z0-9._-]+)(?=\Z|[^A-Za-z0-9._-])"
 )
 ESCAPED_DOT_RE = re.compile(r"\\u002e|\\x2e|&#0*46;|&#x0*2e;|&period;", re.IGNORECASE)
-OBSERVED_ACQ_RE = re.compile(r"g1\.[a-z0-9._]{2,60}acq")
+EVENT_AT_RE = re.compile(r"\A\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z\Z")
 
 BINARY_PREFIXES = (
     "image/",
@@ -49,33 +59,75 @@ BINARY_PREFIXES = (
 )
 
 
+class LocalStateStore:
+    """Thread-safe JSON file store implementing $persistentStore read/write semantics."""
+
+    def __init__(self, state_file: str = STATE_FILE) -> None:
+        self.state_file = state_file
+        self._lock = threading.Lock()
+
+    def _read_root(self) -> tuple[dict[str, Any] | None, str | None]:
+        if not os.path.exists(self.state_file):
+            return {"scan": {}, "test": {}}, None
+        with open(self.state_file, "r", encoding="utf-8") as f:
+            raw = f.read()
+        if not raw.strip():
+            return {"scan": {}, "test": {}}, None
+        try:
+            data = json.loads(raw)
+        except Exception:
+            return None, raw
+        if not isinstance(data, dict):
+            return None, raw
+        return data, raw
+
+    def read(self, key: str) -> str | None:
+        slot = KEY_TO_SLOT.get(key)
+        if slot is None:
+            return None
+        with self._lock:
+            data, raw_file = self._read_root()
+            if data is None:
+                return raw_file if key == mapping_config.KEY else "{}"
+            if slot not in data or data[slot] is None:
+                return None
+            val = data[slot]
+            if isinstance(val, str):
+                return val
+            return json.dumps(val, ensure_ascii=False)
+
+    def write(self, value: str, key: str) -> bool:
+        slot = KEY_TO_SLOT.get(key)
+        if slot is None or not isinstance(value, str):
+            return False
+        try:
+            parsed = json.loads(value)
+        except Exception:
+            parsed = value
+
+        with self._lock:
+            try:
+                data, _ = self._read_root()
+                if data is None:
+                    data = {"scan": {}, "test": {}}
+                else:
+                    data = dict(data)
+                data[slot] = parsed
+                tmp_path = f"{self.state_file}.tmp.{os.getpid()}.{threading.get_ident()}"
+                with open(tmp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, ensure_ascii=False, indent=2)
+                os.replace(tmp_path, self.state_file)
+                return True
+            except Exception:
+                return False
+
+
+DEFAULT_STORE = LocalStateStore()
+
+
 def utc_now() -> str:
     """Return current UTC timestamp in ISO-8601 format with millisecond precision."""
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
-
-
-def load_state() -> dict:
-    """Load persisted scan and test state from local JSON file."""
-    if not os.path.exists(STATE_FILE):
-        return {"scan": {}, "test": {}}
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-            if isinstance(data, dict):
-                return {"scan": data.get("scan", {}), "test": data.get("test", {})}
-    except Exception:
-        pass
-    return {"scan": {}, "test": {}}
-
-
-def save_state(state: dict) -> bool:
-    """Persist scan and test state atomically to local JSON file."""
-    try:
-        with open(STATE_FILE, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        return True
-    except Exception:
-        return False
 
 
 def safe_route(url: str) -> str:
@@ -83,12 +135,89 @@ def safe_route(url: str) -> str:
     path = re.split(r"[?#]", url.replace("https://one.google.com", "", 1))[0].rstrip("/") or "/"
     if path in ("/", "/ai", "/plans"):
         return path
-    if re.match(r"^/_/[^?#]+/data/batchexecute$", path):
+    if re.match(r"\A/_/[^?#]+/data/batchexecute\Z", path):
         return "/_/…/data/batchexecute"
-    return "[other one.google.com path]"
+    return g1_sku_report.OTHER_PATH_LABEL
 
 
-def extract_text_body(resp: http.Response):
+def response_status(body_type: str, candidate_count: int, added_count: int, omitted_count: int) -> str:
+    """Compute scan event status matching crhywun/g1-acq v7.12.0."""
+    if body_type == "non-text":
+        return "non-text"
+    if added_count > 0:
+        return "new-skus"
+    if omitted_count > 0:
+        return "limit-reached"
+    return "known-skus" if candidate_count > 0 else "no-skus"
+
+
+def _prior_count(value: Any) -> int:
+    if isinstance(value, bool) or value is None:
+        return 0
+    try:
+        num = float(value)
+    except Exception:
+        return 0
+    return int(math.floor(num)) if math.isfinite(num) and num > 0 else 0
+
+
+def _prior_response(row: Any) -> dict[str, Any] | None:
+    if not isinstance(row, dict):
+        return None
+    at = row.get("at")
+    if not isinstance(at, str) or not EVENT_AT_RE.match(at):
+        return None
+    try:
+        parsed = datetime.strptime(at, "%Y-%m-%dT%H:%M:%S.%fZ").replace(tzinfo=timezone.utc)
+        if parsed.isoformat(timespec="milliseconds").replace("+00:00", "Z") != at:
+            return None
+    except Exception:
+        return None
+
+    path = row.get("path")
+    if path == "[其他 one.google.com 路径]":
+        path = g1_sku_report.OTHER_PATH_LABEL
+    if path not in g1_sku_report.SCAN_PATHS:
+        return None
+
+    body_type = row.get("bodyType")
+    if body_type not in ("text", "non-text"):
+        return None
+
+    def counter(val: Any, maximum: int) -> int | None:
+        if isinstance(val, bool) or not isinstance(val, (int, float)):
+            return None
+        num = float(val)
+        if not math.isfinite(num):
+            return None
+        return max(0, min(maximum, int(math.floor(num))))
+
+    candidate_count = counter(row.get("candidateCount"), MAX_EVENT_COUNT)
+    if candidate_count is None:
+        return None
+    added_count = counter(row.get("addedCount"), min(SCAN_LIMIT, candidate_count))
+    if added_count is None:
+        return None
+    omitted_count = counter(row.get("omittedCount"), candidate_count - added_count)
+    if omitted_count is None:
+        return None
+    if body_type == "non-text" and (candidate_count or added_count or omitted_count):
+        return None
+    if row.get("status") != response_status(body_type, candidate_count, added_count, omitted_count):
+        return None
+
+    return {
+        "at": at,
+        "path": path,
+        "bodyType": body_type,
+        "status": row["status"],
+        "candidateCount": candidate_count,
+        "addedCount": added_count,
+        "omittedCount": omitted_count,
+    }
+
+
+def extract_text_body(resp: http.Response | None) -> str | None:
     """Return decoded text body for text responses, or None for binary/non-text responses."""
     if resp is None or resp.raw_content is None:
         return None
@@ -101,36 +230,50 @@ def extract_text_body(resp: http.Response):
         return None
 
 
-def collect_original_skus(url: str, original_body) -> None:
-    """Passively collect unique g1.* and com.google.one.* SKUs before any rewrite."""
+def collect_original_skus(
+    store: Any, url: str, original_body: str | None, mode: str
+) -> None:
+    """Passively collect unique g1.*, com.google.one.*, and com.google.gemini.* SKUs before rewriting."""
     now = utc_now()
-    state = load_state()
-    saved = state.get("scan") or {}
-    if saved.get("schemaVersion") != 1:
+    saved: dict[str, Any] = {}
+    try:
+        if store and callable(getattr(store, "read", None)):
+            raw = store.read(SCAN_KEY)
+            loaded = json.loads(raw or "{}")
+            if isinstance(loaded, dict):
+                saved = loaded
+    except Exception:
         saved = {}
 
-    by_id = {}
-    for row in (saved.get("skus") or [])[:SCAN_LIMIT]:
-        if isinstance(row, dict) and isinstance(row.get("id"), str) and VALID_ID_RE.match(row["id"]):
-            rid = row["id"]
-            if rid not in by_id:
-                by_id[rid] = {
-                    "id": rid,
-                    "count": max(0, int(row.get("count") or 0)),
-                    "lastSeen": str(row.get("lastSeen") or "")[:32],
-                }
+    if isinstance(saved.get("schemaVersion"), bool) or saved.get("schemaVersion") != 1:
+        saved = {}
+
+    by_id: dict[str, dict[str, Any]] = {}
+    old_rows = saved.get("skus") if isinstance(saved.get("skus"), list) else []
+    for row in old_rows[:SCAN_LIMIT]:
+        if not isinstance(row, dict):
+            continue
+        rid = row.get("id")
+        if not isinstance(rid, str) or not VALID_ID_RE.match(rid) or rid in by_id:
+            continue
+        last_seen = row.get("lastSeen")
+        by_id[rid] = {
+            "id": rid,
+            "count": _prior_count(row.get("count")),
+            "lastSeen": last_seen[:32] if isinstance(last_seen, str) else "",
+        }
 
     is_text = isinstance(original_body, str)
-    found = {}
+    found: dict[str, int] = {}
     hit_count = 0
     added_count = 0
     omitted_count = 0
-    truncated = bool(saved.get("truncated") is True)
+    truncated = saved.get("truncated") is True
 
     if is_text:
         decoded = ESCAPED_DOT_RE.sub(".", original_body)
-        for m in DISCOVERY_TOKEN_RE.finditer(decoded):
-            sku_id = m.group(2)
+        for match in TOKEN_RE.finditer(decoded):
+            sku_id = match.group(2)
             if not VALID_ID_RE.match(sku_id):
                 continue
             found[sku_id] = found.get(sku_id, 0) + 1
@@ -148,19 +291,16 @@ def collect_original_skus(url: str, original_body) -> None:
 
     candidate_count = len(found)
     body_type = "text" if is_text else "non-text"
-    if not is_text:
-        status = "non-text"
-    elif added_count > 0:
-        status = "new-skus"
-    elif omitted_count > 0:
-        status = "limit-reached"
-    elif candidate_count > 0:
-        status = "known-skus"
-    else:
-        status = "no-skus"
+    status = response_status(body_type, candidate_count, added_count, omitted_count)
 
-    recent = list(saved.get("recentResponses") or [])[-RECENT_LIMIT:]
-    recent.append(
+    recent_responses: list[dict[str, Any]] = []
+    old_responses = saved.get("recentResponses") if isinstance(saved.get("recentResponses"), list) else []
+    for row in old_responses[-RECENT_LIMIT:]:
+        ev = _prior_response(row)
+        if ev is not None:
+            recent_responses.append(ev)
+
+    recent_responses.append(
         {
             "at": now,
             "path": safe_route(url),
@@ -172,205 +312,156 @@ def collect_original_skus(url: str, original_body) -> None:
         }
     )
 
-    state["scan"] = {
+    state = {
         "schemaVersion": 1,
         "version": VERSION,
+        "mode": mode,
         "updatedAt": now,
-        "scannedResponses": int(saved.get("scannedResponses") or 0) + (1 if is_text else 0),
-        "matchedResponses": int(saved.get("matchedResponses") or 0) + (1 if hit_count > 0 else 0),
-        "nonTextResponses": int(saved.get("nonTextResponses") or 0) + (0 if is_text else 1),
-        "recentResponses": recent[-RECENT_LIMIT:],
+        "scannedResponses": _prior_count(saved.get("scannedResponses")) + (1 if is_text else 0),
+        "matchedResponses": _prior_count(saved.get("matchedResponses")) + (1 if hit_count > 0 else 0),
+        "nonTextResponses": _prior_count(saved.get("nonTextResponses")) + (0 if is_text else 1),
+        "recentResponses": recent_responses[-RECENT_LIMIT:],
         "limit": SCAN_LIMIT,
         "truncated": truncated,
         "skus": [by_id[k] for k in sorted(by_id.keys())],
     }
-    stored = save_state(state)
+
+    stored = False
+    try:
+        if store and callable(getattr(store, "write", None)):
+            stored = bool(store.write(json.dumps(state, ensure_ascii=False), SCAN_KEY))
+    except Exception:
+        stored = False
+
     print(
         f"[g1-acq] {VERSION} status={status} addedCount={added_count} "
         f"candidates={candidate_count} omittedCount={omitted_count} "
-        f"occurrences={hit_count} saved={'yes' if stored else 'no'}"
+        f"occurrences={hit_count} saved={'yes' if stored else 'no'} mode={mode}"
     )
     for sku_id in sorted(found.keys())[:SCAN_LIMIT]:
         print(f"[g1-acq]   {sku_id} x{found[sku_id]}")
 
 
-def build_report_payload(state: dict) -> dict:
-    """Build JSON report payload matching g1-sku-report structure."""
-    scan = state.get("scan") or {}
-    test = state.get("test") or {}
-    return {
-        "reportVersion": REPORT_VERSION,
-        "configuredTarget": TARGET,
-        "scan": scan,
-        "test": test,
-    }
-
-
-def render_html(payload: dict, cleared_msg: str = "") -> str:
-    """Render local diagnostic HTML page for Safari on iPhone."""
-    scan = payload.get("scan") or {}
-    test = payload.get("test") or {}
-    skus = scan.get("skus") or []
-    recent = list(reversed(scan.get("recentResponses") or []))
-    matched = test.get("matchedFrom") or []
-
-    sku_rows = "".join(
-        f"<tr><td><code>{html.escape(r['id'])}</code></td><td>{r['count']}</td><td>{html.escape(r.get('lastSeen', ''))}</td></tr>"
-        for r in skus
-    ) or "<tr><td colspan=3>Chưa có dữ liệu SKU.</td></tr>"
-
-    recent_rows = "".join(
-        f"<tr><td>{html.escape(e['at'])}</td><td>{html.escape(e['path'])}</td><td>{html.escape(e['status'])}</td>"
-        f"<td>{e['candidateCount']}</td><td>{e['addedCount']}</td><td>{e['omittedCount']}</td></tr>"
-        for e in recent
-    ) or "<tr><td colspan=6>Chưa có phản hồi nào.</td></tr>"
-
-    match_rows = "".join(
-        f"<tr><td><code>{html.escape(m['id'])}</code></td><td><code>{html.escape(m['to'])}</code></td>"
-        f"<td>{m['count']}</td><td>{'Có' if m.get('fallback') else 'Không'}</td></tr>"
-        for m in matched
-    ) or "<tr><td colspan=4>Chưa có bản ghi viết lại.</td></tr>"
-
-    return f"""<!doctype html>
-<html lang="vi">
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Google One SKU Local Report (mitmproxy)</title>
-<style>
-body{{font:15px/1.5 -apple-system,BlinkMacSystemFont,sans-serif;max-width:960px;margin:20px auto;padding:0 16px;background:#f5f7fa;color:#1c2737}}
-section{{background:#fff;border:1px solid #dde3ec;border-radius:12px;padding:16px;margin:16px 0}}
-.badge{{display:inline-block;background:#e0f4e8;color:#176238;padding:4px 10px;border-radius:8px;font-weight:600}}
-.actions{{display:flex;gap:10px;flex-wrap:wrap;margin:14px 0}}
-.btn{{padding:9px 14px;border-radius:8px;text-decoration:none;background:#1259be;color:#fff;font-weight:500}}
-.btn.sec{{background:#e4eaf3;color:#1c2737}}
-table{{border-collapse:collapse;width:100%;font-size:13px}}
-th,td{{padding:8px;border-bottom:1px solid #e5e7eb;text-align:left}}
-.scroll{{overflow-x:auto}}
-code{{word-break:break-all}}
-</style>
-<h1>Google One SKU Local Report</h1>
-<p class="badge">mitmproxy cục bộ đang hoạt động · {html.escape(REPORT_VERSION)}</p>
-{f'<p><strong>{html.escape(cleared_msg)}</strong></p>' if cleared_msg else ''}
-<div class="actions">
-  <a class="btn" href="https://one.google.com/g1-sku-report?format=json">Tải JSON</a>
-  <a class="btn sec" href="https://one.google.com/g1-sku-report">Làm mới</a>
-  <a class="btn sec" href="https://one.google.com/g1-sku-report?clear=1">Xóa dữ liệu</a>
-</div>
-<section>
-  <h2>Thống kê thu thập</h2>
-  <p>Text responses: {scan.get('scannedResponses', 0)} | Có SKU: {scan.get('matchedResponses', 0)} | Non-text: {scan.get('nonTextResponses', 0)} | Tổng ID: {len(skus)}</p>
-  <p>Cập nhật (UTC): <code>{html.escape(str(scan.get('updatedAt', 'Chưa có')))}</code></p>
-  <div class="scroll"><table><thead><tr><th>Thời gian</th><th>Path</th><th>Trạng thái</th><th>SKU</th><th>Mới</th><th>Bỏ qua</th></tr></thead><tbody>{recent_rows}</tbody></table></div>
-</section>
-<section>
-  <h2>Kết quả ánh xạ gần nhất (/ai?)</h2>
-  <p>Trạng thái: <strong>{html.escape(str(test.get('status', 'Chưa có')))}</strong> | Tổng hit: {test.get('hitCount', 0)} | 2TB hit: {test.get('annualHitCount', 0)}</p>
-  <div class="scroll"><table><thead><tr><th>SKU gốc</th><th>SKU đích</th><th>Số lần</th><th>Fallback</th></tr></thead><tbody>{match_rows}</tbody></table></div>
-</section>
-<section>
-  <h2>Danh sách SKU gốc đã thu thập</h2>
-  <div class="scroll"><table><thead><tr><th>SKU ID</th><th>Số lần</th><th>Thấy lần cuối (UTC)</th></tr></thead><tbody>{sku_rows}</tbody></table></div>
-</section>
-</html>"""
-
-
-def request(flow: http.HTTPFlow) -> None:
-    """Serve local diagnostic report at https://one.google.com/g1-sku-report."""
+def process_request(flow: http.HTTPFlow, store: Any = DEFAULT_STORE) -> None:
+    """Serve local SKU manager / JSON report at https://one.google.com/g1-sku-report."""
     url = flow.request.pretty_url
     if not REPORT_URL_RE.match(url):
         return
 
-    cleared_msg = ""
-    if re.search(r"(?:\?|&)clear=1(?:&|$)", url):
-        save_state({"scan": {}, "test": {}})
-        cleared_msg = "Đã xóa toàn bộ dữ liệu thu thập và lịch sử ánh xạ."
+    req_body: str | None = None
+    if (flow.request.method or "GET").upper() == "POST":
+        try:
+            req_body = flow.request.get_text(strict=True)
+        except Exception:
+            req_body = None
 
-    state = load_state()
-    payload = build_report_payload(state)
-    headers = {"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"}
-
-    if re.search(r"(?:\?|&)format=json(?:&|$)", url):
-        headers["Content-Type"] = "application/json; charset=utf-8"
-        headers["Content-Disposition"] = 'attachment; filename="g1-sku-report.json"'
-        flow.response = http.Response.make(
-            200, json.dumps(payload, ensure_ascii=False, indent=2).encode("utf-8"), headers
-        )
+    result = g1_sku_report.handle_report_request(
+        url=url,
+        method=flow.request.method or "GET",
+        request_headers=flow.request.headers,
+        request_body=req_body,
+        storage=store,
+    )
+    if result is None:
         return
+    flow.response = http.Response.make(
+        result["status"],
+        result["body"].encode("utf-8"),
+        result["headers"],
+    )
 
-    headers["Content-Type"] = "text/html; charset=utf-8"
-    flow.response = http.Response.make(200, render_html(payload, cleared_msg).encode("utf-8"), headers)
 
-
-def response(flow: http.HTTPFlow) -> None:
-    """Collect SKUs on one.google.com/ and rewrite 3-tier SKUs on /ai? responses."""
+def process_response(flow: http.HTTPFlow, store: Any = DEFAULT_STORE) -> None:
+    """Collect SKUs on one.google.com/ and rewrite configured SKU rules on /ai? responses."""
     url = flow.request.pretty_url
-    if not url.startswith("https://one.google.com/") or REPORT_URL_RE.match(url):
+    if not isinstance(url, str) or not ONE_GOOGLE_RE.match(url) or REPORT_URL_RE.match(url):
         return
+
+    engine = mapping_config.MappingConfigEngine(store)
+    cfg = engine.read()
+    mode = cfg["mode"]
+    config_error = cfg["status"] in ("invalid", "unavailable")
+    print(
+        f"[g1-acq] {VERSION} mappingStatus={cfg['status']} "
+        f"mappingRevision={cfg['revision']} mode={mode}"
+    )
 
     body = extract_text_body(flow.response)
     try:
-        collect_original_skus(url, body)
+        collect_original_skus(store, url, body, mode)
     except Exception as exc:
         print(f"[g1-acq] SKU collection unavailable: {exc}")
 
     if not AI_URL_RE.match(url):
         return
 
-    mappings = {}
+    mappings: dict[str, dict[str, Any]] = {}
     hits = 0
     annual_hits = 0
     out = body
 
-    if isinstance(body, str):
-        observed = set(OBSERVED_ACQ_RE.findall(body))
-
-        def repl(match: re.Match) -> str:
+    if isinstance(body, str) and not config_error:
+        def repl(match: re.Match[str]) -> str:
             nonlocal hits, annual_hits
             before = match.group(1)
             sku_id = match.group(2)
-            is_annual = sku_id.startswith(SOURCE_PREFIX) and len(sku_id) > len(SOURCE_PREFIX)
-            fallback = False
-
-            if is_annual:
-                to = TARGET
-            elif sku_id in SKU_MAP:
-                to = SKU_MAP[sku_id]
-                if to not in observed and to in FALLBACK and FALLBACK[to] in observed:
-                    to = FALLBACK[to]
-                    fallback = True
-            else:
+            rule = engine.resolve(sku_id, cfg)
+            if rule is None:
                 return match.group(0)
-
+            is_annual = sku_id.startswith(SOURCE_PREFIX) and len(sku_id) > len(SOURCE_PREFIX)
             if sku_id not in mappings:
-                mappings[sku_id] = {"id": sku_id, "to": to, "count": 0, "fallback": fallback}
+                mappings[sku_id] = {"id": sku_id, "to": rule["to"], "count": 0, "fallback": False}
             mappings[sku_id]["count"] += 1
             hits += 1
             if is_annual:
                 annual_hits += 1
-            return before + to
+            return before + rule["to"]
 
-        out = REWRITE_TOKEN_RE.sub(repl, body)
+        out = TOKEN_RE.sub(repl, body)
 
     sources = [mappings[k] for k in sorted(mappings.keys())]
-    state = load_state()
-    state["test"] = {
+    record_status = (
+        "config-error"
+        if config_error
+        else ("non-text" if not isinstance(body, str) else ("rewritten" if hits else "no-match"))
+    )
+    record = {
         "schemaVersion": 1,
         "version": VERSION,
+        "mode": mode,
         "updatedAt": utc_now(),
+        "mappingRevision": cfg["revision"],
+        "mappingUpdatedAt": cfg["updatedAt"],
+        "mappingStatus": cfg["status"],
         "sourcePrefix": SOURCE_PREFIX,
-        "target": TARGET,
-        "targetOrigin": "user-specified",
+        "target": cfg["target"],
+        "targetOrigin": cfg["targetOrigin"],
         "hitCount": hits,
         "annualHitCount": annual_hits,
         "matchedFrom": sources,
-        "status": "non-text" if not isinstance(body, str) else ("rewritten" if hits else "no-match"),
+        "status": record_status,
     }
-    save_state(state)
 
-    print(f"[g1-acq] {VERSION} hits={hits} annualHits={annual_hits}")
+    try:
+        if store and callable(getattr(store, "write", None)):
+            if not store.write(json.dumps(record, ensure_ascii=False), TEST_KEY):
+                print("[g1-acq] local record write failed")
+    except Exception:
+        print("[g1-acq] local record unavailable")
+
+    print(f"[g1-acq] {VERSION} hits={hits} annualHits={annual_hits} mode={mode}")
     for s in sources:
-        fb = f" fallback={s['to']}" if s["fallback"] else ""
-        print(f"[g1-acq]   {s['id']} -> {s['to']} x{s['count']}{fb}")
+        print(f"[g1-acq]   {s['id']} -> {s['to']} x{s['count']}")
 
-    if hits > 0 and isinstance(out, str):
+    if hits > 0 and isinstance(out, str) and flow.response is not None:
         flow.response.text = out
+
+
+def request(flow: http.HTTPFlow) -> None:
+    """mitmproxy request hook."""
+    process_request(flow, DEFAULT_STORE)
+
+
+def response(flow: http.HTTPFlow) -> None:
+    """mitmproxy response hook."""
+    process_response(flow, DEFAULT_STORE)

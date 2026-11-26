@@ -8,8 +8,12 @@ set "VENV_DIR=%BASE_DIR%.venv"
 set "MITM_EXE=%VENV_DIR%\Scripts\mitmdump.exe"
 set "VENV_PY=%VENV_DIR%\Scripts\python.exe"
 set "SCRIPT_PY=%BASE_DIR%g1_acq_mitm.py"
+set "MAPPING_PY=%BASE_DIR%mapping_config.py"
+set "REPORT_PY=%BASE_DIR%g1_sku_report.py"
 
 if not exist "%SCRIPT_PY%" goto :missing_script
+if not exist "%MAPPING_PY%" goto :missing_script
+if not exist "%REPORT_PY%" goto :missing_script
 if not exist "%MITM_EXE%" goto :need_setup
 
 "%MITM_EXE%" --version >nul 2>&1
@@ -74,7 +78,7 @@ pause
 exit /b 0
 
 :missing_script
-echo [LOI] Khong tim thay file g1_acq_mitm.py trong cung thu muc!
-echo Hay dam bao chay_g1_acq.bat va g1_acq_mitm.py nam cung 1 folder.
+echo [LOI] Khong tim thay du cac file ma nguon (g1_acq_mitm.py, mapping_config.py, g1_sku_report.py) trong cung thu muc!
+echo Hay dam bao chay_g1_acq.bat va cac file .py nam cung 1 folder.
 pause
 exit /b 1
