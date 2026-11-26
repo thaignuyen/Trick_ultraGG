@@ -2,3 +2,6 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.lnk
+g1_acq_state.json
+
