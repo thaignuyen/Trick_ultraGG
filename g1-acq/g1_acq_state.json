@@ -1,0 +1,158 @@
+{
+  "scan": {
+    "schemaVersion": 1,
+    "version": "g1-acq-v7.6",
+    "updatedAt": "2026-11-25T13:34:14.713Z",
+    "scannedResponses": 5,
+    "matchedResponses": 1,
+    "nonTextResponses": 0,
+    "recentResponses": [
+      {
+        "at": "2026-11-25T13:33:10.366Z",
+        "path": "/ai",
+        "bodyType": "text",
+        "status": "new-skus",
+        "candidateCount": 12,
+        "addedCount": 12,
+        "omittedCount": 0
+      },
+      {
+        "at": "2026-11-25T13:33:11.541Z",
+        "path": "/_/…/data/batchexecute",
+        "bodyType": "text",
+        "status": "no-skus",
+        "candidateCount": 0,
+        "addedCount": 0,
+        "omittedCount": 0
+      },
+      {
+        "at": "2026-11-25T13:33:11.692Z",
+        "path": "/_/…/data/batchexecute",
+        "bodyType": "text",
+        "status": "no-skus",
+        "candidateCount": 0,
+        "addedCount": 0,
+        "omittedCount": 0
+      },
+      {
+        "at": "2026-11-25T13:33:14.367Z",
+        "path": "[other one.google.com path]",
+        "bodyType": "text",
+        "status": "no-skus",
+        "candidateCount": 0,
+        "addedCount": 0,
+        "omittedCount": 0
+      },
+      {
+        "at": "2026-11-25T13:34:14.713Z",
+        "path": "[other one.google.com path]",
+        "bodyType": "text",
+        "status": "no-skus",
+        "candidateCount": 0,
+        "addedCount": 0,
+        "omittedCount": 0
+      }
+    ],
+    "limit": 300,
+    "truncated": false,
+    "skus": [
+      {
+        "id": "g1.ios.100gb.a.12month_ip_15p",
+        "count": 4,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.100gb.m.3month_ip_75p",
+        "count": 4,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.20tb.m.v2",
+        "count": 16,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.2tb.a.12month_ip_15p",
+        "count": 4,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.2tb.m.3month_ip_75p",
+        "count": 4,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.30gb.a.12month_ip_15p",
+        "count": 4,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.30gb.m.3month_ip_75p",
+        "count": 8,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.30tb.ai.pro.m",
+        "count": 10,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.ai.2tb.a.ip_1yr_10p.acq",
+        "count": 9,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.ai.2tb.m.ip_3mo_75p.acq",
+        "count": 10,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.helium.a.ip_1yr_10p.acq",
+        "count": 9,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      },
+      {
+        "id": "g1.ios.helium.m.3month_ip_75p.acq",
+        "count": 10,
+        "lastSeen": "2026-11-25T13:33:10.366Z"
+      }
+    ]
+  },
+  "test": {
+    "schemaVersion": 1,
+    "version": "g1-acq-v7.6",
+    "updatedAt": "2026-11-25T13:33:10.549Z",
+    "sourcePrefix": "g1.ios.2tb.",
+    "target": "g1.2tb.ai.12months_ip_90p",
+    "targetOrigin": "user-specified",
+    "hitCount": 34,
+    "annualHitCount": 8,
+    "matchedFrom": [
+      {
+        "id": "g1.ios.20tb.m.v2",
+        "to": "g1.20tb.1month_eft.acq",
+        "count": 16,
+        "fallback": false
+      },
+      {
+        "id": "g1.ios.2tb.a.12month_ip_15p",
+        "to": "g1.2tb.ai.12months_ip_90p",
+        "count": 4,
+        "fallback": false
+      },
+      {
+        "id": "g1.ios.2tb.m.3month_ip_75p",
+        "to": "g1.2tb.ai.12months_ip_90p",
+        "count": 4,
+        "fallback": false
+      },
+      {
+        "id": "g1.ios.30tb.ai.pro.m",
+        "to": "g1.ai.ultra.1month_eft.acq",
+        "count": 10,
+        "fallback": false
+      }
+    ],
+    "status": "rewritten"
+  }
+}
